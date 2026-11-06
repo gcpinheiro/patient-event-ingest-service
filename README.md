@@ -1,98 +1,95 @@
-<p align="center">
-  <a href="http://nestjs.com/" target="blank"><img src="https://nestjs.com/img/logo-small.svg" width="120" alt="Nest Logo" /></a>
-</p>
+# Patient Event Ingest Service
 
-[circleci-image]: https://img.shields.io/circleci/build/github/nestjs/nest/master?token=abc123def456
-[circleci-url]: https://circleci.com/gh/nestjs/nest
+NestJS + MongoDB: durable HTTP ingestion, canonical deduplication and asynchronous processing in one collection.
 
-  <p align="center">A progressive <a href="http://nodejs.org" target="_blank">Node.js</a> framework for building efficient and scalable server-side applications.</p>
-    <p align="center">
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/v/@nestjs/core.svg" alt="NPM Version" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/l/@nestjs/core.svg" alt="Package License" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/dm/@nestjs/common.svg" alt="NPM Downloads" /></a>
-<a href="https://circleci.com/gh/nestjs/nest" target="_blank"><img src="https://img.shields.io/circleci/build/github/nestjs/nest/master" alt="CircleCI" /></a>
-<a href="https://discord.gg/G7Qnnhy" target="_blank"><img src="https://img.shields.io/badge/discord-online-brightgreen.svg" alt="Discord"/></a>
-<a href="https://opencollective.com/nest#backer" target="_blank"><img src="https://opencollective.com/nest/backers/badge.svg" alt="Backers on Open Collective" /></a>
-<a href="https://opencollective.com/nest#sponsor" target="_blank"><img src="https://opencollective.com/nest/sponsors/badge.svg" alt="Sponsors on Open Collective" /></a>
-  <a href="https://paypal.me/kamilmysliwiec" target="_blank"><img src="https://img.shields.io/badge/Donate-PayPal-ff3f59.svg" alt="Donate us"/></a>
-    <a href="https://opencollective.com/nest#sponsor"  target="_blank"><img src="https://img.shields.io/badge/Support%20us-Open%20Collective-41B883.svg" alt="Support us"></a>
-  <a href="https://twitter.com/nestframework" target="_blank"><img src="https://img.shields.io/twitter/follow/nestframework.svg?style=social&label=Follow" alt="Follow us on Twitter"></a>
-</p>
-  <!--[![Backers on Open Collective](https://opencollective.com/nest/backers/badge.svg)](https://opencollective.com/nest#backer)
-  [![Sponsors on Open Collective](https://opencollective.com/nest/sponsors/badge.svg)](https://opencollective.com/nest#sponsor)-->
+## Run
 
-## Description
+Requires Docker Desktop (Linux containers).
 
-[Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
-
-## Project setup
-
-```bash
-$ npm install
+```sh
+docker compose up -d --build
+curl http://localhost:3000/health/ready
 ```
 
-## Compile and run the project
+The API listens on port 3000. MongoDB is internal to the Compose network and persists data in a named volume. Development MongoDB has no authentication: do not expose it publicly. Docker Compose down preserves data; adding -v deletes the volume.
 
-```bash
-# development
-$ npm run start
+## Contract
 
-# watch mode
-$ npm run start:dev
+POST /events accepts:
 
-# production mode
-$ npm run start:prod
+```json
+{
+  "patientId": "PAT-123",
+  "type": "MEDICATION_UPDATED",
+  "data": { "dose": 10 },
+  "ts": "2026-11-06T09:15:00Z"
+}
 ```
 
-## Run tests
+Returns 202 with eventId and current status, only after a successful MongoDB insert (or lookup of a duplicate). Invalid fields return 400; unavailable persistence returns 503. Identifiers are trimmed, limited to 256 characters and cannot be blank. ts requires a valid ISO8601 timestamp with timezone. Extra fields are rejected; the default Express JSON size limit applies.
 
-```bash
-# unit tests
-$ npm run test
+Retries return the original eventId and its current status. Object keys are sorted recursively before hashing, array order remains significant, and timestamps are normalized to UTC. SHA-256 plus a unique index handles concurrent duplicates. Index initialization completes before accepting HTTP traffic.
 
-# e2e tests
-$ npm run test:e2e
+GET /health/live reports HTTP process availability. GET /health/ready pings MongoDB and returns 503 when unavailable. Readiness does not measure worker progress.
 
-# test coverage
-$ npm run test:cov
+## Processing
+
+Controller validates, service persists, worker polls. patient_events stores payload, status, attempts, lease, result and timestamps; no separate broker or second collection is required.
+
+Run **one worker instance**. The in-process active-patient map serializes each patient while allowing 100 different patients concurrently. The earliest unfinished event is selected by ts, with _id breaking ties. Claiming is an atomic conditional update. Processing waits five seconds, then saves a simulated result and processedAt.
+
+Every attempt receives a random lease token. Updates must match that token, preventing a stale attempt from overwriting a recovered attempt. Leases expire after 60 seconds. Expired work is retried after five seconds. Processor failures use backoff (5 seconds, then 15 seconds), with three attempts maximum. Exhausted events remain failed and block subsequent events for that patient. Operators must investigate before deliberately resetting failed work; there is no automatic skip.
+
+Graceful shutdown stops polling and awaits active work. Abrupt termination is handled through lease expiration. If processing succeeds but its result cannot be saved, recovery may execute the processor again.
+
+## Guarantees and trade-offs
+
+- Processing is **at least once**, not exactly once externally. There is one durable document per fingerprint. A real external system must accept the fingerprint as an idempotency key to avoid repeated side effects.
+- Per-patient ordering requires a single active worker. Do not scale replicas with workers enabled. Distributed patient ownership and ingestion coordination are future work.
+- Ordering covers events known when work is selected. Arbitrarily late events cannot undo external effects. Strict event-time order needs source sequence numbers, watermarks or replay.
+- Identical legitimate payloads are indistinguishable from retries. A source-provided event ID would improve the contract. Hashing is not anonymization.
+- At 1000 events/minute and five seconds/event, average concurrency is about 84; default capacity is 100. One hot patient is limited to approximately 12 events/minute.
+- Polling uses distinct patient IDs and per-patient queries for clarity. Very large backlogs require bounded, fair scheduling and improved observability.
+- Standalone MongoDB with a volume tolerates process restarts, not disk or host loss. Production requires replicated storage, backups, access controls and encrypted transport.
+- No clinical payloads are logged; stored processing errors are generic. UI, authentication, real clinical logic and CI/CD are outside this assignment.
+
+## Tests
+
+```sh
+npm ci
+npm run build
+npm test -- --runInBand
+npx eslint src
 ```
 
-## Deployment
+MongoDB integration tests (PowerShell, repository root, after Docker build):
 
-When you're ready to deploy your NestJS application to production, there are some key steps you can take to ensure it runs as efficiently as possible. Check out the [deployment documentation](https://docs.nestjs.com/deployment) for more information.
-
-If you are looking for a cloud-based platform to deploy your NestJS application, check out [Mau](https://mau.nestjs.com), our official platform for deploying NestJS applications on AWS. Mau makes deployment straightforward and fast, requiring just a few simple steps:
-
-```bash
-$ npm install -g @nestjs/mau
-$ mau deploy
+```powershell
+docker compose run --rm --no-deps -v "${PWD}/test:/app/test:ro" api node test/integration.cjs
 ```
 
-With Mau, you can deploy your application in just a few clicks, allowing you to focus on building features rather than managing infrastructure.
+The script creates a uniquely named temporary database and deletes only that database afterward. It checks simultaneous deduplication, ordering, parallelism, expired lease recovery, retry, stale-token rejection and failed-predecessor blocking. An injected fast/failing processor makes failure paths deterministic; deployed processing retains the real five-second delay.
 
-## Resources
+Load testing (use a new RUN_ID each time):
 
-Check out a few resources that may come in handy when working with NestJS:
+```powershell
+docker run --rm -v "${PWD}/test:/scripts:ro" -e RUN_ID=example-1 grafana/k6:latest run /scripts/load.js
+docker compose exec mongodb mongosh patient_event_ingest
+```
 
-- Visit the [NestJS Documentation](https://docs.nestjs.com) to learn more about the framework.
-- For questions and support, please visit our [Discord channel](https://discord.gg/G7Qnnhy).
-- To dive deeper and get more hands-on experience, check out our official video [courses](https://courses.nestjs.com/).
-- Deploy your application to AWS with the help of [NestJS Mau](https://mau.nestjs.com) in just a few clicks.
-- Visualize your application graph and interact with the NestJS application in real-time using [NestJS Devtools](https://devtools.nestjs.com).
-- Need help with your project (part-time to full-time)? Check out our official [enterprise support](https://enterprise.nestjs.com).
-- To stay in the loop and get updates, follow us on [X](https://x.com/nestframework) and [LinkedIn](https://linkedin.com/company/nestjs).
-- Looking for a job, or have a job to offer? Check out our official [Jobs board](https://jobs.nestjs.com).
+In mongosh, inspect the run:
 
-## Support
+```javascript
+db.patient_events.countDocuments({ 'data.run': 'example-1' })
+db.patient_events.countDocuments({ 'data.run': 'example-1', status: 'processed' })
+```
 
-Nest is an MIT-licensed open source project. It can grow thanks to the sponsors and support by the amazing backers. If you'd like to join them, please [read more here](https://docs.nestjs.com/support).
+The scenario sends 1000 events/minute for one minute across 200 patients, requiring all requests to return 202, p95 below one second and no dropped iterations. Synthetic data remains available for inspection.
 
-## Stay in touch
+Verified locally on 2026-11-06: 16 unit tests passed; integration checks passed; k6 accepted 1001/1001 requests, with zero failures or dropped iterations and p95 210.86 ms. MongoDB subsequently contained 1001 processed load events, all with attempts=1. This one-minute capacity smoke test does not prove hours-long stability. Extend duration for soak testing.
 
-- Author - [Kamil Myśliwiec](https://twitter.com/kammysliwiec)
-- Website - [https://nestjs.com](https://nestjs.com/)
-- Twitter - [@nestframework](https://twitter.com/nestframework)
+## Configuration and evolution
 
-## License
+MONGODB_URI is required. PORT defaults to 3000, WORKER_CONCURRENCY to 100; WORKER_ENABLED=false disables processing. Configure container environment in Compose. The .env.example is for host execution, which also needs a reachable MongoDB.
 
-Nest is [MIT licensed](https://github.com/nestjs/nest/blob/master/LICENSE).
+Commits separate infrastructure, schema, ingestion, deduplication, worker, recovery, integration tests, load testing and documentation. Next production steps: distributed patient ownership, source event IDs/sequences, monitoring, authenticated inspection/replay, bounded scheduling and sustained failure/load testing.
