@@ -50,6 +50,9 @@ export class PatientEvent {
   leaseToken!: string | null;
 
   @Prop({ default: null, type: Date })
+  nextAttemptAt!: Date | null;
+
+  @Prop({ default: null, type: Date })
   processedAt!: Date | null;
 
   @Prop({ default: null, type: MongooseSchema.Types.Mixed })

@@ -10,6 +10,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import { randomUUID } from 'node:crypto';
 import { PatientEvent } from './schemas/patient-event.schema';
 import { EventStatus } from './event-status.enum';
+import { EventProcessor } from './event.processor';
 
 @Injectable()
 export class EventWorker implements OnModuleInit, OnModuleDestroy {
@@ -22,6 +23,7 @@ export class EventWorker implements OnModuleInit, OnModuleDestroy {
   constructor(
     @InjectModel(PatientEvent.name)
     private readonly events: Model<PatientEvent>,
+    private readonly processor: EventProcessor,
   ) {}
 
   async onModuleInit() {
@@ -40,6 +42,31 @@ export class EventWorker implements OnModuleInit, OnModuleDestroy {
   private async run() {
     while (!this.stopped) {
       try {
+        await this.events
+          .updateMany(
+            {
+              status: EventStatus.Processing,
+              leaseUntil: { $lte: new Date() },
+            },
+            [
+              {
+                $set: {
+                  status: {
+                    $cond: [
+                      { $gte: ['$attempts', 3] },
+                      EventStatus.Failed,
+                      EventStatus.Pending,
+                    ],
+                  },
+                  nextAttemptAt: new Date(Date.now() + 5000),
+                  leaseUntil: null,
+                  leaseToken: null,
+                  error: 'Processing lease expired',
+                },
+              },
+            ],
+          )
+          .exec();
         const patients = await this.events.distinct('patientId', {
           status: { $in: [EventStatus.Pending, EventStatus.Processing] },
         });
@@ -64,6 +91,8 @@ export class EventWorker implements OnModuleInit, OnModuleDestroy {
       .sort({ ts: 1, _id: 1 })
       .exec();
     if (!first || first.status !== EventStatus.Pending) return;
+    if (first.nextAttemptAt && first.nextAttemptAt.getTime() > Date.now())
+      return;
     const token = randomUUID();
     const event = await this.events
       .findOneAndUpdate(
@@ -80,7 +109,29 @@ export class EventWorker implements OnModuleInit, OnModuleDestroy {
       )
       .exec();
     if (!event) return;
-    await delay(5000);
+    let result: Record<string, unknown>;
+    try {
+      result = await this.processor.process();
+    } catch {
+      await this.events
+        .updateOne(
+          { _id: event._id, leaseToken: token, status: EventStatus.Processing },
+          {
+            $set: {
+              status:
+                event.attempts >= 3 ? EventStatus.Failed : EventStatus.Pending,
+              nextAttemptAt: new Date(
+                Date.now() + 5000 * 3 ** (event.attempts - 1),
+              ),
+              leaseToken: null,
+              leaseUntil: null,
+              error: 'External processor failed',
+            },
+          },
+        )
+        .exec();
+      return;
+    }
     await this.events
       .updateOne(
         { _id: event._id, status: EventStatus.Processing, leaseToken: token },
@@ -88,7 +139,7 @@ export class EventWorker implements OnModuleInit, OnModuleDestroy {
           $set: {
             status: EventStatus.Processed,
             processedAt: new Date(),
-            result: { simulated: true },
+            result,
             leaseUntil: null,
             leaseToken: null,
             error: null,
