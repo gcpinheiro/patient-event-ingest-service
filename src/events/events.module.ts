@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { MongooseModule } from '@nestjs/mongoose';
 import { EventsController } from './events.controller';
 import { EventsService } from './events.service';
+import { EventWorker } from './event.worker';
 import {
   PatientEvent,
   PatientEventSchema,
@@ -15,6 +16,6 @@ import {
   ],
   exports: [MongooseModule],
   controllers: [EventsController],
-  providers: [EventsService],
+  providers: [EventsService, EventWorker],
 })
 export class EventsModule {}

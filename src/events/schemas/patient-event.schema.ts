@@ -46,6 +46,15 @@ export class PatientEvent {
   @Prop({ default: null, type: String })
   error!: string | null;
 
+  @Prop({ default: null, type: String })
+  leaseToken!: string | null;
+
+  @Prop({ default: null, type: Date })
+  processedAt!: Date | null;
+
+  @Prop({ default: null, type: MongooseSchema.Types.Mixed })
+  result!: Record<string, unknown> | null;
+
   createdAt!: Date;
 
   updatedAt!: Date;
