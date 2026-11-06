@@ -3,6 +3,7 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
 import { MongooseModule } from '@nestjs/mongoose';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
+import { EventsModule } from './events/events.module';
 import { HealthModule } from './health/health.module';
 
 @Module({
@@ -18,6 +19,7 @@ import { HealthModule } from './health/health.module';
         uri: configService.getOrThrow<string>('MONGODB_URI'),
       }),
     }),
+    EventsModule,
     HealthModule,
   ],
   controllers: [AppController],
